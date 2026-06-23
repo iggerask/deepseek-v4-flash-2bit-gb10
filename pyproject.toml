@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vq2-vllm"
+version = "0.1.0"
+description = "vq2 2-bit-VQ MoE quantization method for vLLM — serves DeepSeek-V4-Flash 2-bit on one DGX Spark (GB10, sm_121)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Ingemar Rask" }]
+# Heavy runtime deps (vllm 0.23.0, torch+cu130, flashinfer, triton, tilelang, the cu13
+# nvidia stack) are NOT pinned here — they must come from the sm_121 wheel sources via
+# install.sh / requirements-serve.lock.txt. Pinning them here would fight the cu130 index.
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+# vLLM auto-discovers this on `import vllm`; register() installs the vq2 quant method
+# and the sm_121 monkeypatches. No fork, no manual import.
+vq2 = "vq2_vllm:register"
+
+[tool.setuptools]
+packages = ["vq2_vllm"]
+
+[tool.setuptools.package-data]
+# The kernels live beside the plugin and are added to sys.path at import (they import each
+# other by bare name). Ship the .py modules AND the CUDA source (JIT-compiled at first prefill).
+vq2_vllm = ["kernels/*.py", "kernels/*.cu"]

@@ -1,0 +1,12 @@
+# the model is on Hugging Face, never in git (101 GB)
+/models/
+*.safetensors
+# venv
+.venv*/
+__pycache__/
+*.pyc
+# CUDA JIT build cache
+*.so
+build/
+# logs
+*.log
