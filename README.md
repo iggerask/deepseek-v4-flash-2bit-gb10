@@ -4,7 +4,7 @@ Serve **DeepSeek-V4-Flash** (299 B params, MoE) **2-bit-quantized** on a **singl
 (GB10, 128 GB, sm_121)** with **stock vLLM 0.23.0 + a small plugin — no vLLM fork**.
 
 - **~107 GB** self-contained model (2-bit VQ experts + NVFP4 hot path) → fits one Spark *with* long-context KV.
-- **~41 tok/s** single-stream decode (MTP K=3 spec-decode + FR-Spec), coherent instruction-following.
+- **~22 tok/s** single-stream decode on realistic chat (MTP K=2, **+29 %** over the 17.4 non-spec baseline; TPOT ~39 ms) — and **up to ~40 tok/s** on long, predictable generations. Coherent; measured over the OpenAI chat API with `vllm bench serve`.
 - **Quality:** PPL 4.64 vs the FP4 source's 3.66 on a matched corpus (+27 %, the floor for 2-bit experts at this size; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
 - Runs the datacenter-Blackwell DS4 model on consumer-Blackwell sm_121 via **runtime torch/Triton kernel replacements** (the plugin monkeypatches them in; no native sm_121 build needed).
 
@@ -32,7 +32,7 @@ python -c "import vllm, vq2_vllm; print('vq2 plugin OK')"
 # 3. download the model (~101 GB) from Hugging Face
 python scripts/download_model.py                 # -> models/DeepSeek-V4-Flash-2bit
 
-# 4. verify: coherence + decode tok/s (expect "Paris", finish_reason=stop, ~41 tok/s)
+# 4. verify: coherence + decode tok/s (expect "Paris", finish_reason=stop, ~22 tok/s on realistic chat)
 python scripts/bench.py
 
 # 5. use it
@@ -54,11 +54,12 @@ fails to resolve on your box, that is the first thing to debug — the pins in
 | compressor, indexer, norms, router, embed | **BF16** | stock |
 | KV cache | **fp8** (the DS4 FlashMLA path requires it) | stock |
 
-Speed stack: **MTP** (the model's built-in `mtp.0` draft head, K=3 spec-decode, FULL cudagraph) +
-**FR-Spec** (the draft's lm_head restricted to a frequency-ranked shortlist; target verifies full
-vocab so output is exact). Both are on by default in `scripts/`. The FR-Spec weight
-(`frspec_nvfp4_ds4.pt`) ships **inside the model repo** (it's model-derived lm_head rows) and is
-auto-loaded from the model dir — `download_model.py` brings it down with the weights.
+Speed stack: **MTP** — the model's built-in `mtp.0` draft head, **K=2** spec-decode (the measured
+optimum; K=3 over-drafts — its 3rd token rarely accepts but makes verify K+1=4, net slower), captured in
+one FULL cudagraph. Measured **+29 %** over non-spec on realistic chat. A second lever, **FR-Spec**
+(frequency-shortlisted draft lm_head, `frspec_nvfp4_ds4.pt`, shipped inside the model repo), is wired in
+but **currently inactive** under the plugin load path — the MTP draft head ties to the unquantized
+embedding, so the builder falls back to the full lm_head (measured marginal regardless).
 
 ## How it was built
 
@@ -77,14 +78,15 @@ monkeypatches over **stock** vLLM (no fork).
 - **sparse-MLA forward** (Triton, online-softmax flash) + **lightning-indexer logits** (torch) —
   graph-safe sm_121 replacements for the gated `_flashmla_C` kernels.
 
-**Decode speed trajectory** (single-stream) — from a naive torch reference (~1 tok/s) to ~41:
+**Decode speed trajectory** (single-stream, measured over the chat API) — from a naive torch reference (~1 tok/s):
 - The biggest non-obvious win was killing a per-step **full-KV-cache `reshape().contiguous()` copy**
   that was **~78 % of decode** (the paged cache is padded/non-contiguous, so flattening copied multi-GB
   every step × 43 layers). Indexing the cache with native strides + assembling RoPE in-kernel fixed it.
 - Caching the `o_proj` dequant, arithmetic-E2M1 unpacking, and bf16 activations in the vq2 kernel
-  reached the **batch-1 ceiling ~18–20 tok/s** (decode is gather-throughput-bound, not DRAM-bound).
-- **MTP** spec-decode (K=3) with the whole verify captured in **one FULL cudagraph** → ~29; a
-  **tensor-core verify `o_proj`** → ~39; **FR-Spec** (cheap draft lm_head) → **~41**.
+  reached the **non-spec batch-1 ceiling ~17 tok/s** (decode is gather-throughput-bound, not DRAM-bound).
+- **MTP** spec-decode with the verify in **one FULL cudagraph** + a **tensor-core verify `o_proj`** →
+  **~22 tok/s on realistic chat (+29 %)**, up to **~40 on long predictable generations** (high draft
+  acceptance). K-sweep on the same ShareGPT-chat bench: non-spec 17.4 / K=1 21.4 / **K=2 22.5** / K=3 20.6 tok/s.
 
 **Quality investigation.** The +27 % PPL cost was traced to genuine precision loss in the 2-bit experts
 (not a bug, not the NVFP4 path) and shown to be **memory-bound, not quantizer-bound**: PPL falls
@@ -99,13 +101,12 @@ OpenAI-compatible HTTP server, the plugin works under `vllm serve` too — pass 
 
 ```bash
 CUTE_DSL_ARCH=sm_121a VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-VLLM_FRSPEC_NVFP4=$(pwd)/models/DeepSeek-V4-Flash-2bit/frspec_nvfp4_ds4.pt \
 VQ2_EXPERTS_DIR=$(pwd)/models/DeepSeek-V4-Flash-2bit \
 vllm serve models/DeepSeek-V4-Flash-2bit \
   --trust-remote-code --dtype bfloat16 --kv-cache-dtype fp8 \
   --max-model-len 8192 --max-num-seqs 1 --gpu-memory-utilization 0.92 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
-  --compilation-config '{"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,2,4,8,16],"cudagraph_copy_inputs":true}'
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+  --compilation-config '{"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,2,3,4,8,16],"cudagraph_copy_inputs":true}'
 ```
 
 ## Notes & limitations

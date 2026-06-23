@@ -20,7 +20,7 @@ import _common  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default=os.environ.get("MODEL", "models/DeepSeek-V4-Flash-2bit"))
 ap.add_argument("--max-model-len", type=int, default=int(os.environ.get("MAX_MODEL_LEN", "4096")))
-ap.add_argument("--spec-mtp", default=os.environ.get("SPEC_MTP", "3"))
+ap.add_argument("--spec-mtp", default=os.environ.get("SPEC_MTP", "2"))
 ap.add_argument("--gen", type=int, default=int(os.environ.get("GEN", "256")), help="decode steps to time")
 ap.add_argument("--no-frspec", action="store_true")
 args = ap.parse_args()

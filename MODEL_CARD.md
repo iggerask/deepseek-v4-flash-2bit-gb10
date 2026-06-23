@@ -22,7 +22,7 @@ tags:
 
 A **2-bit quantization of [`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)**
 (299 B params, MoE) that serves on a **single NVIDIA DGX Spark (GB10, 128 GB, sm_121)** — where the
-~159 GB FP8/MXFP4 source needs ~2 — at **~41 tok/s** single-stream decode, coherent.
+~159 GB FP8/MXFP4 source needs ~2 — at **~22 tok/s** single-stream decode on realistic chat (up to ~40 on long-form), coherent.
 
 > ⚠️ **This checkpoint is NOT loadable by stock vLLM/transformers.** It uses a custom `vq2`
 > quantization method served by a small open-source plugin. You must install the serving stack:
@@ -55,15 +55,16 @@ It is an **instruct** model — use the chat template (`llm.chat` / a chat endpo
 | compressor, indexer, norms, router, embed | BF16 |
 | KV cache | fp8 |
 
-Plus the model's built-in **MTP** draft head (K=3 spec-decode) and **FR-Spec** (frequency-shortlisted
-draft lm_head; target verifies full vocab so output is exact).
+Plus the model's built-in **MTP** draft head (**K=2** spec-decode, the measured optimum). A second lever,
+**FR-Spec** (frequency-shortlisted draft lm_head, `frspec_nvfp4_ds4.pt`), is shipped but currently inactive
+under the plugin load path (falls back to the full draft lm_head; measured marginal regardless).
 
 ## Quality & speed
 
 - **Perplexity** (matched concatenated 512-tok chunks): **4.64** vs the FP4 source's **3.66** (+27 %).
   This is genuine 2-bit-expert precision loss and is *memory-bound* — closing it to source needs
   ≥4.25 bpw experts (~2 Sparks). +27 % is the floor for 2-bit experts at this parameter count.
-- **Decode:** ~41 tok/s (MTP K=3 + FR-Spec) / ~18–20 tok/s (no spec), single-stream on one GB10.
+- **Decode (single-stream, chat API, `vllm bench serve`):** **~22 tok/s** on realistic chat (MTP K=2, +29 % over the 17.4 non-spec baseline; TPOT ~39 ms), up to **~40** on long predictable generations. K-sweep (ShareGPT chat): non-spec 17.4 / K=1 21.4 / K=2 22.5 / K=3 20.6 tok/s.
 - Coherent instruction-following; terminates on EOS.
 
 ## Hardware

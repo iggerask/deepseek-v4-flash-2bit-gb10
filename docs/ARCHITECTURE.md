@@ -61,20 +61,27 @@ floor for 2-bit experts at this parameter count.
 
 ## Speed
 
-Single-stream decode on GB10 (diff-method, 256-tok):
+Single-stream, measured over the OpenAI **chat** endpoint with `vllm bench serve` (ShareGPT prompts,
+identical across rows):
 
-| configuration | tok/s |
-|---|---|
-| base 2-bit serve (no spec) | ~18–20 |
-| + MTP K=3 (FULL cudagraph) | ~31–39 |
-| + FR-Spec draft lm_head shortlist | **~41** |
+| configuration | tok/s | TPOT | MTP accept-len |
+|---|---|---|---|
+| non-spec (no MTP) | 17.4 | 50.0 ms | — |
+| MTP K=1 | 21.4 | 39.5 ms | 1.67 |
+| **MTP K=2** (default) | **22.5** | 39.1 ms | 2.08 |
+| MTP K=3 | 20.6 | 44.0 ms | 2.14 |
+| best-case: long predictable generation | ~40 | ~25 ms | 3.6 |
 
-**MTP** reuses the model's built-in `mtp.0` draft head (K=3 spec-decode; the verify batch and the
-single-token draft are FULL-cudagraph-captured). **FR-Spec** restricts the *draft's* lm_head to a
-frequency-ranked token shortlist (`frspec_nvfp4_ds4.pt`, shipped in the model repo, kept in the same
-NVFP4 as the target); the **target still verifies the full vocab**, so generated text is unchanged — only draft
-proposals (hence acceptance) are affected. The decode bottleneck is the gather-throughput-bound VQ
-MoE; ~41 tok/s is at the practical batch-1 ceiling for this model on this chip.
+**MTP** reuses the model's built-in `mtp.0` draft head; the verify batch and single-token draft are
+FULL-cudagraph-captured. **K=2 is the measured optimum** — at K=3 the 3rd draft token rarely accepts
+(accept-len 2.08→2.14) but makes the verify K+1=4, net slower. The speedup is **acceptance-bound**:
+~+29 % over non-spec on realistic chat, rising toward ~2× on long, predictable generations
+(accept-len ~3.6). The decode bottleneck is the gather-throughput-bound VQ MoE.
+
+**FR-Spec** (frequency-shortlisted draft lm_head, `frspec_nvfp4_ds4.pt`) is wired in but **currently
+inactive**: under the entry-point load path the MTP draft head ties to the unquantized embedding, so the
+builder falls back to the full draft lm_head. Measured marginal regardless (the best-case ~40 was reached
+with it off), so K=2 alone is the live speed lever.
 
 ## Scope
 

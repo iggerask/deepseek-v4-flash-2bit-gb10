@@ -16,16 +16,18 @@ def setup_env(model_dir, frspec=None):
         os.environ["VLLM_FRSPEC_NVFP4"] = frspec
 
 
-def build_llm(model_dir, max_model_len=4096, spec_mtp=3):
-    """Construct the LLM with the verified recipe. spec_mtp=None/0 -> no speculative decode."""
+def build_llm(model_dir, max_model_len=4096, spec_mtp=2):
+    """Construct the LLM with the verified recipe. spec_mtp=None/0 -> no speculative decode.
+    K=2 is the measured optimum for realistic single-stream chat (see README); K=3 over-drafts
+    (the 3rd token rarely accepts but makes verify K+1=4, net slower)."""
     from vllm import LLM
     extra = {}
     if spec_mtp:
         extra["speculative_config"] = {"method": "mtp", "num_speculative_tokens": int(spec_mtp)}
         # FULL cudagraph captures the whole K+1 verify in one graph (no PIECEWISE attn breaks);
-        # capture sizes cover the single-token draft (1) and the verify batch (K+1).
+        # capture sizes cover the single-token draft (1) and the verify batch (K+1 = 3 at K=2).
         extra["compilation_config"] = {
-            "cudagraph_capture_sizes": [1, 2, 4, 8, 16],
+            "cudagraph_capture_sizes": [1, 2, 3, 4, 8, 16],
             "cudagraph_copy_inputs": True,
             "cudagraph_mode": "FULL",
         }

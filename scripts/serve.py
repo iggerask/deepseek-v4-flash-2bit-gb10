@@ -18,7 +18,7 @@ import _common  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default=os.environ.get("MODEL", "models/DeepSeek-V4-Flash-2bit"))
 ap.add_argument("--max-model-len", type=int, default=int(os.environ.get("MAX_MODEL_LEN", "4096")))
-ap.add_argument("--spec-mtp", default=os.environ.get("SPEC_MTP", "3"), help="MTP draft length K; '' or 0 disables")
+ap.add_argument("--spec-mtp", default=os.environ.get("SPEC_MTP", "2"), help="MTP draft length K (2 = measured optimum); '' or 0 disables")
 ap.add_argument("--frspec", default=os.environ.get("VLLM_FRSPEC_NVFP4"),
                 help="reduced FR-Spec draft lm_head; default <model>/frspec_nvfp4_ds4.pt (ships with the model)")
 ap.add_argument("--max-tokens", type=int, default=512)
