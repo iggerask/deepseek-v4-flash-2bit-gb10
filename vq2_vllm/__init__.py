@@ -461,6 +461,95 @@ def _patch_drafter_full_cudagraph():
     SpecDecodeBaseProposer._vq2_full_cg = True
 
 
+def _patch_workspace_overalloc():
+    """Shrink the sparse-MLA + lightning-indexer PREFILL workspaces that vLLM sizes by
+    max_model_len, not by the actual prefill token budget. flashmla_sparse uses 5*max_model_len
+    (get_prefill_workspace_size) and the indexer uses 40*max_model_len (get_max_prefill_buffer_size)
+    -- both untuned 'magic' multipliers that assume ">2GB of free MoE workspace so it's free". That
+    is FALSE for the 2-bit model on a 128GB box: a ~95GB model + a KV pool leaves only single-digit
+    GB, and those workspaces are ~GBs of pure slack that ate the headroom and OOM-froze long-context
+    prefill (KV itself had room -- not the wall). SAFE to shrink: flashmla's split_prefill_chunks()
+    sizes prefill chunks to FIT the workspace, so a smaller workspace just means more/smaller chunks
+    (identical result); the indexer workspace stays >= max_model_len for any div<=~10. Gated by
+    VQ2_WORKSPACE_DIV (divisor on the multiplier; default 1 = upstream behavior; 3 frees ~2GB).
+    Needed only for long-context serving (max_model_len well above the default)."""
+    import os
+    try:
+        div = float(os.environ.get("VQ2_WORKSPACE_DIV", "1"))
+    except ValueError:
+        div = 1.0
+    if div <= 1.0:
+        return
+    try:
+        import vllm.v1.attention.backends.mla.flashmla_sparse as fms
+        import vllm.v1.attention.backends.mla.indexer as idx
+        _o_fms = fms.get_prefill_workspace_size
+        _o_idx = idx.get_max_prefill_buffer_size
+
+        def _fms(max_model_len, _o=_o_fms, _d=div):
+            return max(1, int(_o(max_model_len) / _d))
+
+        def _idx(vllm_config, _o=_o_idx, _d=div):
+            return max(1, int(_o(vllm_config) / _d))
+
+        fms.get_prefill_workspace_size = _fms
+        idx.get_max_prefill_buffer_size = _idx
+        print(f"[vq2] prefill workspace over-alloc shrunk {div}x "
+              f"(flashmla 5x->/{div}, indexer 40x->/{div}; VQ2_WORKSPACE_DIV)", flush=True)
+    except Exception as e:  # pragma: no cover
+        print(f"[vq2] WARN: could not shrink prefill workspace over-alloc: {e}", flush=True)
+
+
+def _patch_adaptive_prefill():
+    """ADAPTIVE prefill chunk sizing for single-stream long context.
+
+    Every prefill chunk re-runs the full MoE (compute/gather-bound on the 2-bit codebook
+    experts), so prefill time scales with the NUMBER of chunks. A fixed small max_num_batched_tokens
+    (needed to bound the per-chunk memory transient at very long context) creates too many chunks.
+    This sets long_prefill_token_threshold per scheduler pass = BUDGET / (context_so_far * BPU),
+    clamped to [MINCHUNK, MAXCHUNK]: large chunks early (context small -> small transient), shrinking
+    only as context approaches the headroom ceiling -> far fewer chunks at no extra peak memory.
+    Single-stream (max-num-seqs 1): the one in-prefill request's num_computed_tokens IS the
+    context-so-far; decode is unaffected (it schedules 1 token). Gated by VQ2_ADAPTIVE_PREFILL=1;
+    tune with VQ2_ADAPT_BUDGET / VQ2_ADAPT_BPU / VQ2_ADAPT_MAXCHUNK / VQ2_ADAPT_MINCHUNK. Requires
+    --max-num-batched-tokens >= MAXCHUNK. Pair with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    (the long-ctx prefill transient is dominated by allocator fragmentation, not a single tensor)."""
+    import os
+    if os.environ.get("VQ2_ADAPTIVE_PREFILL", "0") != "1":
+        return
+    budget = float(os.environ.get("VQ2_ADAPT_BUDGET", "5.0e9"))
+    bpu = float(os.environ.get("VQ2_ADAPT_BPU", "6.2"))
+    max_chunk = int(os.environ.get("VQ2_ADAPT_MAXCHUNK", "16384"))
+    min_chunk = int(os.environ.get("VQ2_ADAPT_MINCHUNK", "512"))
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    except Exception as e:  # pragma: no cover
+        print(f"[vq2] WARN adaptive prefill: cannot import Scheduler: {e}", flush=True)
+        return
+    _orig = Scheduler.schedule
+
+    def _adaptive(self, _o=_orig, _b=budget, _bpu=bpu, _mx=max_chunk, _mn=min_chunk):
+        try:
+            ctx = 0
+            for r in self.running:
+                if r.num_computed_tokens < r.num_prompt_tokens:  # still ingesting prompt
+                    if r.num_computed_tokens > ctx:
+                        ctx = r.num_computed_tokens
+            chunk = int(_b / (ctx * _bpu)) if ctx > 0 else _mx
+            if chunk < _mn:
+                chunk = _mn
+            elif chunk > _mx:
+                chunk = _mx
+            self.scheduler_config.long_prefill_token_threshold = chunk
+        except Exception:
+            pass
+        return _o(self)
+
+    Scheduler.schedule = _adaptive
+    print(f"[vq2] ADAPTIVE prefill ON (budget={budget:.2g}B bpu={bpu} "
+          f"chunk in [{min_chunk},{max_chunk}]; VQ2_ADAPTIVE_PREFILL)", flush=True)
+
+
 def _patch_frspec():
     """FR-Spec: restrict the MTP DRAFT lm_head to a frequency-ranked shortlist (top-N
     most frequent tokens). The TARGET still verifies full-vocab, so quality is EXACT —
@@ -566,6 +655,8 @@ def register():
     _patch_o_proj()
     _patch_lm_head()
     _patch_sparse_attn()
+    _patch_workspace_overalloc()   # long-ctx: shrink max_model_len-sized prefill workspaces (VQ2_WORKSPACE_DIV)
+    _patch_adaptive_prefill()      # long-ctx: adaptive prefill chunk sizing (VQ2_ADAPTIVE_PREFILL)
     _patch_drafter_full_cudagraph()
     _patch_frspec()
     # NOTE: there is NO compressor KV "fix" here. An earlier session mis-diagnosed a compress_ratio=1

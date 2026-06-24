@@ -112,7 +112,15 @@ vllm serve models/DeepSeek-V4-Flash-2bit \
 - **GB10-specific.** The kernel replacements target sm_121; on datacenter Blackwell (sm_100) use the
   upstream DS4 kernels instead.
 - **Instruct model** — use the chat template (`llm.chat` / the server's chat endpoint), not raw completion.
-- **Long context** is gated only by `--max-model-len` (KV is ~27 KB/token; verified to 392 K tokens).
+- **Long context (256k–512k single-stream)** needs a few extra knobs to fit a ~95 GB model in 128 GB
+  (the KV is cheap; the squeeze is the prefill working set + allocator headroom). Recipe:
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (auto-set; eliminates the caching-allocator
+  fragmentation that is the real long-ctx "memory wall") · `KV_CACHE_MEMORY_BYTES` to cap the MLA KV
+  pool to one stream · `VQ2_WORKSPACE_DIV=3` to shrink the `max_model_len`-sized prefill workspaces ·
+  `GPU_UTIL=0.85` · `VQ2_ADAPTIVE_PREFILL=1` + `MAX_NUM_BATCHED_TOKENS=4096` for adaptive prefill
+  chunking. Decode stays ~13–14 tok/s flat to 128k. **Caveat:** long-context *prefill* is slow and
+  compute-bound (the 2-bit MoE + sparse-indexer kernels saturate the SMs at low occupancy, not DRAM) —
+  TTFT is minutes at 100k+; kernel speedups are active work. ~960k single-stream needs ~2 Sparks.
 - **fp8 KV is required** by the DS4 FlashMLA path (it hard-asserts fp8).
 - The first prefill JIT-compiles `vq2_grouped.cu` (needs `nvcc` on PATH); subsequent runs are cached.
 
