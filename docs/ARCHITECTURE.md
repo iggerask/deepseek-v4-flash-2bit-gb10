@@ -59,6 +59,22 @@ quantizer-bound**: PPL responds steeply to expert bits (excess ∝ rel^~2.8), so
 experts would close it, but ≥4.25 bpw experts (~150 GB) need ~2 Sparks. On one Spark, +27 % is the
 floor for 2-bit experts at this parameter count.
 
+## Capability (downstream tasks)
+
+lm-evaluation-harness over the OpenAI **chat** endpoint (no custom harness), on the served 2-bit model:
+
+| benchmark | score | setup |
+|---|---|---|
+| GSM8K | **95.0 %** (±1.3) | exact_match, flexible-extract, 5-shot, 300 q |
+| MMLU-Pro | **66.4 %** (±2.8) | exact_match, 5-shot CoT, 280 q |
+| HumanEval-Instruct | **65.2 % pass@1** (±3.7) | 0-shot, full 164 |
+
+The 2-bit quant preserves capability well: HumanEval is within ~4 pt of the source model card's claimed
+~69.5, and GSM8K is strong. **Caveats:** MMLU-Pro and GSM8K are subsets (280/300 q, for a bounded
+overnight eval) so the ± is wider than a full run; MMLU-Pro is the *hard* variant and is **not**
+comparable to the ~88.7 regular-MMLU figure on the source card. Served at concurrency 6 (the gather-bound
+decode doesn't scale past that) with `max_gen_toks=1024` on MMLU-Pro to avoid runaway-length generations.
+
 ## Speed
 
 Single-stream, measured over the OpenAI **chat** endpoint with `vllm bench serve` (ShareGPT prompts,

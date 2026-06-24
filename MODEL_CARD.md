@@ -64,6 +64,7 @@ under the plugin load path (falls back to the full draft lm_head; measured margi
 - **Perplexity** (matched concatenated 512-tok chunks): **4.64** vs the FP4 source's **3.66** (+27 %).
   This is genuine 2-bit-expert precision loss and is *memory-bound* — closing it to source needs
   ≥4.25 bpw experts (~2 Sparks). +27 % is the floor for 2-bit experts at this parameter count.
+- **Capability** (lm-evaluation-harness over the chat API — no custom harness): **GSM8K 95.0 %** (±1.3, 5-shot, 300 q) · **MMLU-Pro 66.4 %** (±2.8, 5-shot CoT, 280 q) · **HumanEval-Instruct 65.2 % pass@1** (±3.7, 0-shot, full 164). Within ~4 pt of the source card's HumanEval ~69.5 — the 2-bit quant preserves downstream ability. MMLU-Pro/GSM8K are subsets (wider ±); MMLU-Pro is the *hard* variant, not the ~88.7 regular-MMLU figure.
 - **Decode (single-stream, chat API, `vllm bench serve`):** **~22 tok/s** on realistic chat (MTP K=2, +29 % over the 17.4 non-spec baseline; TPOT ~39 ms), up to **~40** on long predictable generations. K-sweep (ShareGPT chat): non-spec 17.4 / K=1 21.4 / K=2 22.5 / K=3 20.6 tok/s.
 - Coherent instruction-following; terminates on EOS.
 

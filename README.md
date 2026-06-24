@@ -6,6 +6,7 @@ Serve **DeepSeek-V4-Flash** (299 B params, MoE) **2-bit-quantized** on a **singl
 - **~107 GB** self-contained model (2-bit VQ experts + NVFP4 hot path) → fits one Spark *with* long-context KV.
 - **~22 tok/s** single-stream decode on realistic chat (MTP K=2, **+29 %** over the 17.4 non-spec baseline; TPOT ~39 ms) — and **up to ~40 tok/s** on long, predictable generations. Coherent; measured over the OpenAI chat API with `vllm bench serve`.
 - **Quality:** PPL 4.64 vs the FP4 source's 3.66 on a matched corpus (+27 %, the floor for 2-bit experts at this size; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)).
+- **Capability** (lm-evaluation-harness over the chat API): GSM8K **95.0 %** · MMLU-Pro **66.4 %** · HumanEval **65.2 % pass@1** — within ~4 pt of the source card's HumanEval ~69.5, so 2-bit preserves task ability (MMLU-Pro/GSM8K measured on 280/300-q subsets).
 - Runs the datacenter-Blackwell DS4 model on consumer-Blackwell sm_121 via **runtime torch/Triton kernel replacements** (the plugin monkeypatches them in; no native sm_121 build needed).
 
 > The plugin + kernels (this repo) are **Apache-2.0**. The **model weights** are a derivative of
