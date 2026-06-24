@@ -80,9 +80,6 @@ monkeypatches over **stock** vLLM (no fork).
   graph-safe sm_121 replacements for the gated `_flashmla_C` kernels.
 
 **Decode speed trajectory** (single-stream, measured over the chat API) — from a naive torch reference (~1 tok/s):
-- The biggest non-obvious win was killing a per-step **full-KV-cache `reshape().contiguous()` copy**
-  that was **~78 % of decode** (the paged cache is padded/non-contiguous, so flattening copied multi-GB
-  every step × 43 layers). Indexing the cache with native strides + assembling RoPE in-kernel fixed it.
 - Caching the `o_proj` dequant, arithmetic-E2M1 unpacking, and bf16 activations in the vq2 kernel
   reached the **non-spec batch-1 ceiling ~17 tok/s** (decode is gather-throughput-bound, not DRAM-bound).
 - **MTP** spec-decode with the verify in **one FULL cudagraph** + a **tensor-core verify `o_proj`** →
