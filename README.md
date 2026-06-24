@@ -73,7 +73,10 @@ monkeypatches over **stock** vLLM (no fork).
 - **vq2 W2A16 VQ fused-MoE GEMV** (Triton) — the 2-bit expert path: one shared codebook + 10-bit
   byte-plane indices, with group-Hadamard incoherence folded into the activation (`y = W·x = Ŵ_rot·(Hᵀx)`).
 - **`vq2_grouped.cu`** — a CUTLASS-style **WMMA grouped GEMM** for prefill (each expert's indices read
-  coalesced once, tensor-core accumulate).
+  coalesced once, tensor-core accumulate). The gate/up + down GEMMs run **fp8 `mma.sync.m16n8k32.e4m3`**
+  (the model's native activation regime) and a Triton atomic-counter **`moe_align`** (31× the torch
+  one-hot/cumsum) — together **~1.48× the MoE**, **~1.3× end-to-end prefill** (8–64k, measured), quality-neutral
+  (+0.76 % PPL). On by default (`VQ2_FP8_PREFILL` / `VQ2_FAST_ALIGN`).
 - **grouped W4A16 `o_proj`** (Triton `tl.dot`) — replaces DS4's fused-FP8 path so `wo_a` stays NVFP4
   (no FP8 downgrade); reads the 4-bit weight once and loops the spec-verify batch.
 - **sparse-MLA forward** (Triton, online-softmax flash) + **lightning-indexer logits** (torch) —
@@ -118,9 +121,12 @@ vllm serve models/DeepSeek-V4-Flash-2bit \
   fragmentation that is the real long-ctx "memory wall") · `KV_CACHE_MEMORY_BYTES` to cap the MLA KV
   pool to one stream · `VQ2_WORKSPACE_DIV=3` to shrink the `max_model_len`-sized prefill workspaces ·
   `GPU_UTIL=0.85` · `VQ2_ADAPTIVE_PREFILL=1` + `MAX_NUM_BATCHED_TOKENS=4096` for adaptive prefill
-  chunking. Decode stays ~13–14 tok/s flat to 128k. **Caveat:** long-context *prefill* is slow and
-  compute-bound (the 2-bit MoE + sparse-indexer kernels saturate the SMs at low occupancy, not DRAM) —
-  TTFT is minutes at 100k+; kernel speedups are active work. ~960k single-stream needs ~2 Sparks.
+  chunking. Decode stays ~13–14 tok/s flat to 128k. **Prefill** is ~285 tok/s flat at 8–64k (fp8 MoE +
+  fast-align, above) — bounded by a *fundamental* MoE floor: top-8-of-256 routing means ~all 256 experts
+  activate by ~128 tokens, so every forward reads the full ~95 GB of 2-bit experts once (~4 s fixed,
+  amortized over the prompt). The non-MoE residue (an O(N²) vLLM-internal MLA bmm) only dominates at very
+  long context — **TTFT is still minutes at 100k+**, where a hierarchical indexer (HISA) or ~2 Sparks is
+  the real lever, not more kernel micro-opt (the fp8 ladder on indexer/attention is L2-bound, a wash).
 - **fp8 KV is required** by the DS4 FlashMLA path (it hard-asserts fp8).
 - The first prefill JIT-compiles `vq2_grouped.cu` (needs `nvcc` on PATH); subsequent runs are cached.
 

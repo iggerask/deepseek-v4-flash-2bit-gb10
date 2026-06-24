@@ -1,5 +1,5 @@
 """CUDA grouped vq2 MoE (prefill): coalesced per-expert index reads + fused gather/scatter.
-Compiles vq2_grouped.cu (bundled alongside) on first import; matches the decode kernel semantics."""
+Compiles vq2_grouped.cu on first import. Wrapper matches vq2_moe_fused_10b semantics."""
 import os, torch
 from torch.utils.cpp_extension import load
 import triton, triton.language as tl
@@ -38,9 +38,10 @@ _EXT = None
 def _ext():
     global _EXT
     if _EXT is None:
-        _EXT = load(name="vq2_grouped",
+        diag = os.environ.get("VQ2_DIAG", "0")           # compile-time diagnostic/variant selector
+        _EXT = load(name=f"vq2_grouped_d{diag}",
                     sources=[os.path.join(_HERE, "vq2_grouped.cu")],
-                    extra_cuda_cflags=["-O3", "--use_fast_math",
+                    extra_cuda_cflags=["-O3", "--use_fast_math", f"-DVQ2_DIAG={diag}",
                                        "-gencode=arch=compute_121a,code=sm_121a"],
                     verbose=True)
     return _EXT
@@ -92,15 +93,21 @@ def vq2_moe_grouped_wmma(x, topk_ids, topk_w, Cgu, lgu, hgu, sgu, Cd, ld, hd, sd
     # routing weight (vb). DS4 is fp8-native so this is quality-neutral (+0.2% PPL).
     xh, inv_xh = quant_fp8_rows(vq2.had_act_batch(x.float(), group))   # fp8 [N,Hp], inv [N]
     nsg = xh.shape[1] // vd
+    # VQ2_FP8_PREFILL: native fp8 mma.sync gateup/down (2x tensor cores + halve As/Bs traffic) ~1.4x
+    # on the MoE. Quality-neutral: activations are already per-token-scaled fp8 (in-range) and the
+    # centroid*scale is saturated to the e4m3 range; rel-vs-half ~3% = the accepted fp8-prefill band.
+    fp8 = os.environ.get("VQ2_FP8_PREFILL", "1") == "1"   # default ON (shipped: 1.41x+1.48x, +0.76% PPL, model's native fp8 regime)
+    gateup = ext.gateup_wmma_fp8 if fp8 else ext.gateup_wmma
+    down = ext.down_wmma_fp8 if fp8 else ext.down_wmma
     interf = torch.empty(Pmax, TwoI, device=x.device, dtype=torch.float32)
-    ext.gateup_wmma(xh, sorted_tok, be, Cgu.half(), lgu, hgu, sgu.half(), interf, nblk, TwoI, nsg, SPG, NN, BKC, NW)
+    gateup(xh, sorted_tok, be, Cgu.half(), lgu, hgu, sgu.half(), interf, nblk, TwoI, nsg, SPG, NN, BKC, NW)
     inter = torch.empty(Pmax, I, device=x.device, dtype=torch.float32)
     ext.silu_comb(interf, inter, sorted_tok, inv_xh, Pmax, I)
     vb, inv_vb = quant_fp8_rows(vq2.had_act_batch(inter, group))       # fp8 [Pmax,Ip], inv [Pmax]
     nsd = vb.shape[1] // vd
     w_scaled = (w_sorted * inv_vb).contiguous()                    # fold per-token inv_vb into routing weight
     out = torch.zeros(N, H, device=x.device, dtype=torch.float32)
-    ext.down_wmma(vb, be, sorted_tok, w_scaled, Cd.half(), ld, hd, sdn.half(), out, nblk, H, nsd, SPG, NN, BKC, NW)
+    down(vb, be, sorted_tok, w_scaled, Cd.half(), ld, hd, sdn.half(), out, nblk, H, nsd, SPG, NN, BKC, NW)
     return out
 
 
@@ -112,7 +119,16 @@ if __name__ == "__main__":
     E, H, I, vd, kcb, grp = 256, 4096, 2048, 4, 1024, 64; SPG = grp // vd
 
     REAL = os.environ.get("REAL", "")
-    if REAL:
+    if REAL and REAL.endswith(".safetensors"):
+        # real fused-expert layer (CLUSTERED codebook indices -- the realistic gather pattern; random
+        # u8 indices overstate gather/bank-conflict cost, see memory). Keys mirror bench_vq2_verify.py.
+        print(f"[real-st] loading {REAL}", flush=True)
+        from safetensors import safe_open
+        f = safe_open(REAL, "pt", device=dev); g = lambda k: f.get_tensor(k)
+        Cgu, lgu, hgu, sgu = g("w13_cb").half(), g("w13_lo"), g("w13_hi"), g("w13_sc").half()
+        Cd, ld, hd, sdn = g("w2_cb").half(), g("w2_lo"), g("w2_hi"), g("w2_sc").half()
+        print(f"[real-st] gu lo {tuple(lgu.shape)} dn lo {tuple(ld.shape)}", flush=True)
+    elif REAL:
         print(f"[real] loading {REAL}", flush=True)
         d = torch.load(REAL, map_location=dev, weights_only=False)
         Cgu, lgu, hgu, sgu = d["gu"]; Cd, ld, hd, sdn = d["dn"]
@@ -170,12 +186,54 @@ if __name__ == "__main__":
             invx = torch.ones(Ntok, device=dev)
             interf = torch.zeros(Pmax, TwoI, device=dev); inter = torch.empty(Pmax, I, device=dev)
             print(f"  [breakdown N={Ntok} Pmax={Pmax} nblk={nblk}]", flush=True)
-            print("   gateup_wmma", round(t(lambda: ext.gateup_wmma(xh, sti, be, Cgu.half(), lgu, hgu, sgu.half(), interf, nblk, TwoI, nsg, SPG, NN, BKC, NW)), 2), "ms", flush=True)
+            ghalf = round(t(lambda: ext.gateup_wmma(xh, sti, be, Cgu.half(), lgu, hgu, sgu.half(), interf, nblk, TwoI, nsg, SPG, NN, BKC, NW)), 2)
+            print("   gateup_wmma", ghalf, "ms", flush=True)
+            if os.environ.get("FP8MMA") == "1":
+                interf8 = torch.zeros(Pmax, TwoI, device=dev)
+                ext.gateup_wmma(xh, sti, be, Cgu.half(), lgu, hgu, sgu.half(), interf, nblk, TwoI, nsg, SPG, NN, BKC, NW)
+                ext.gateup_wmma_fp8(xh, sti, be, Cgu.half(), lgu, hgu, sgu.half(), interf8, nblk, TwoI, nsg, SPG, NN, BKC, NW)
+                rel = ((interf - interf8).norm() / interf.norm().clamp_min(1e-6)).item()
+                gf8 = round(t(lambda: ext.gateup_wmma_fp8(xh, sti, be, Cgu.half(), lgu, hgu, sgu.half(), interf8, nblk, TwoI, nsg, SPG, NN, BKC, NW)), 2)
+                print(f"   gateup_fp8  {gf8} ms ({ghalf/max(gf8,1e-6):.2f}x)  rel-vs-half={rel:.4f}", flush=True)
             print("   silu_comb  ", round(t(lambda: ext.silu_comb(interf, inter, sti, invx, Pmax, I)), 2), "ms", flush=True)
-            vb = vq2k.had_act_batch(inter, grp).to(torch.float8_e4m3fn).contiguous(); nsd = vb.shape[1] // vd
+            vb = vq2k.had_act_batch(inter, grp).clamp(-448, 448).to(torch.float8_e4m3fn).contiguous(); nsd = vb.shape[1] // vd
             out = torch.zeros(Ntok, H, device=dev)
-            print("   down+scatter", round(t(lambda: ext.down_wmma(vb, be, sti, ws, Cd.half(), ld, hd, sdn.half(), out, nblk, H, nsd, SPG, NN, BKC, NW)), 2), "ms", flush=True)
+            dhalf = round(t(lambda: ext.down_wmma(vb, be, sti, ws, Cd.half(), ld, hd, sdn.half(), out, nblk, H, nsd, SPG, NN, BKC, NW)), 2)
+            print("   down+scatter", dhalf, "ms", flush=True)
+            if os.environ.get("FP8MMA") == "1":
+                out_h = torch.zeros(Ntok, H, device=dev); ext.down_wmma(vb, be, sti, ws, Cd.half(), ld, hd, sdn.half(), out_h, nblk, H, nsd, SPG, NN, BKC, NW)
+                out_8 = torch.zeros(Ntok, H, device=dev); ext.down_wmma_fp8(vb, be, sti, ws, Cd.half(), ld, hd, sdn.half(), out_8, nblk, H, nsd, SPG, NN, BKC, NW)
+                reld = ((out_h - out_8).norm() / out_h.norm().clamp_min(1e-6)).item()
+                df8 = round(t(lambda: ext.down_wmma_fp8(vb, be, sti, ws, Cd.half(), ld, hd, sdn.half(), out_8, nblk, H, nsd, SPG, NN, BKC, NW)), 2)
+                print(f"   down_fp8    {df8} ms ({dhalf/max(df8,1e-6):.2f}x)  rel-vs-half={reld:.4f}", flush=True)
             print("   had(x)     ", round(t(lambda: vq2k.had_act_batch(x.float(), grp)), 2), "ms", flush=True)
+            # --- OVERHEAD attribution (the non-kernel cost that dilutes the fp8 MoE win) ---
+            from moe_align import moe_align_fast
+            print("   moe_align  ", round(t(lambda: moe_align(tid, E, BM)), 2), "ms (torch)", flush=True)
+            print("   moe_align_fast", round(t(lambda: moe_align_fast(tid, E, BM)), 2), "ms (triton atomic)", flush=True)
+            _m = lambda: vq2_moe_grouped_wmma(x, tid, tw, Cgu, lgu, hgu, sgu, Cd, ld, hd, sdn, group=grp, NW=NW, NN=NN, BKC=BKC)
+            os.environ["VQ2_FAST_ALIGN"] = "0"; m0 = _m()
+            os.environ["VQ2_FAST_ALIGN"] = "1"; m1 = _m()
+            os.environ["VQ2_FAST_ALIGN"] = "0"
+            print(f"   fast-align MoE rel-vs-torch-align: {((m0 - m1).norm() / m0.norm().clamp_min(1e-6)).item():.2e}", flush=True)
+            print("   quant_fp8(had(x))", round(t(lambda: quant_fp8_rows(vq2k.had_act_batch(x.float(), grp))), 2), "ms", flush=True)
+            print("   quant_fp8(had(inter)) [vb, Pmax rows]", round(t(lambda: quant_fp8_rows(vq2k.had_act_batch(inter, grp))), 2), "ms", flush=True)
+            print("   allocs (interf+out zeros)", round(t(lambda: (torch.empty(Pmax, TwoI, device=dev), torch.zeros(Ntok, H, device=dev))), 2), "ms", flush=True)
+            _moe = lambda: vq2_moe_grouped_wmma(x, tid, tw, Cgu, lgu, hgu, sgu, Cd, ld, hd, sdn, group=grp, NW=NW, NN=NN, BKC=BKC)
+            cfgs = {"baseline": ("0", "0"), "+fp8": ("1", "0"), "+fp8+fast": ("1", "1")}
+            def _run(c):
+                os.environ["VQ2_FP8_PREFILL"], os.environ["VQ2_FAST_ALIGN"] = cfgs[c]; _moe()
+            for c in cfgs: _run(c)                                  # warmup all
+            mins = {c: 1e9 for c in cfgs}
+            for _ in range(12):                                    # INTERLEAVED -> min robust to clock drift
+                for c in cfgs:
+                    torch.cuda.synchronize(); s = time.time(); _run(c); torch.cuda.synchronize()
+                    mins[c] = min(mins[c], (time.time() - s) * 1e3)
+            os.environ["VQ2_FP8_PREFILL"] = "0"; os.environ["VQ2_FAST_ALIGN"] = "0"
+            b = mins["baseline"]
+            print(f"   FULL vq2_moe_grouped_wmma [interleaved min]: baseline {b:.1f}ms | "
+                  f"+fp8 {mins['+fp8']:.1f}ms ({b/mins['+fp8']:.2f}x) | "
+                  f"+fp8+fast {mins['+fp8+fast']:.1f}ms ({b/mins['+fp8+fast']:.2f}x)", flush=True)
 
     for Ntok in (512, 1024, 2048, 4096):
         x, tid, tw = inp(Ntok)

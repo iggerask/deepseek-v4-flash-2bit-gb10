@@ -198,19 +198,33 @@ __global__ void __launch_bounds__(NW * 32, 2) gemm_gateup_wmma(
       int gc0 = ko + ki * 4;
       for (int idx = threadIdx.x; idx < BM * MT; idx += blockDim.x) {
         int m = idx >> 4, kk = idx & 15; int tk = toks[m];
+#if VQ2_DIAG == 3
+        As[idx] = __float2half(0.5f);   // skip the xh global activation read -> isolate activation reload
+#else
         As[idx] = (tk >= 0) ? (__half)xh[(long)tk * H + gc0 * 4 + kk] : __float2half(0.f);
+#endif
       }
       for (int idx = threadIdx.x; idx < NR * 4; idx += blockDim.x) {
         int col = idx >> 2, cq = idx & 3;
         int sc_chunk = ki * 4 + cq;
+        float sc = __half2float(sc_s[col * (BKC / SPG) + sc_chunk / SPG]);
+        __half2* dst = (__half2*)(Bs + col * MT + cq * 4);
+#if VQ2_DIAG == 1
+        // DIAG=1: skip the codebook lookup entirely (no lo/hi decode, no cb[id] gather) -> isolates
+        // the TOTAL gather cost. Fill Bs with sc so the WMMA still runs on real-ish data.
+        __half2 sv = __floats2half2_rn(sc, sc); dst[0] = sv; dst[1] = sv;
+#else
+#if VQ2_DIAG == 2
+        int id = 0;   // conflict-free codebook (all lookups hit cb[0]) -> isolates BANK CONFLICTS
+#else
         int id = lo_s[col * BKC + sc_chunk] |
                  (((hi_s[col * (BKC / 4) + (sc_chunk >> 2)] >> ((sc_chunk & 3) * 2)) & 3) << 8);
-        float sc = __half2float(sc_s[col * (BKC / SPG) + sc_chunk / SPG]);
+#endif
         const __half2* cv = (const __half2*)(cb + id * 4);
         float2 a = __half22float2(cv[0]), b = __half22float2(cv[1]);
-        __half2* dst = (__half2*)(Bs + col * MT + cq * 4);
         dst[0] = __floats2half2_rn(a.x * sc, a.y * sc);
         dst[1] = __floats2half2_rn(b.x * sc, b.y * sc);
+#endif
       }
       __syncthreads();
       wmma::fragment<wmma::matrix_a, MT, MT, MT, __half, wmma::row_major> af[BM / MT];
@@ -221,7 +235,9 @@ __global__ void __launch_bounds__(NW * 32, 2) gemm_gateup_wmma(
         wmma::fragment<wmma::matrix_b, MT, MT, MT, __half, wmma::col_major> bf;
         wmma::load_matrix_sync(bf, Bs + (warp * NN + j) * MT * MT, MT);
 #pragma unroll
+#if VQ2_DIAG != 4
         for (int m = 0; m < BM / MT; m++) wmma::mma_sync(acc[m][j], af[m], bf, acc[m][j]);
+#endif
       }
       __syncthreads();
     }
@@ -297,14 +313,24 @@ __global__ void __launch_bounds__(NW * 32, 2) gemm_down_wmma(
       for (int idx = threadIdx.x; idx < NR * 4; idx += blockDim.x) {
         int col = idx >> 2, cq = idx & 3;
         int sc_chunk = ki * 4 + cq;
+        float sc = __half2float(sc_s[col * (BKC / SPG) + sc_chunk / SPG]);
+        __half2* dst = (__half2*)(Bs + col * MT + cq * 4);
+#if VQ2_DIAG == 1
+        // DIAG=1: skip the codebook lookup entirely (no lo/hi decode, no cb[id] gather) -> isolates
+        // the TOTAL gather cost. Fill Bs with sc so the WMMA still runs on real-ish data.
+        __half2 sv = __floats2half2_rn(sc, sc); dst[0] = sv; dst[1] = sv;
+#else
+#if VQ2_DIAG == 2
+        int id = 0;   // conflict-free codebook (all lookups hit cb[0]) -> isolates BANK CONFLICTS
+#else
         int id = lo_s[col * BKC + sc_chunk] |
                  (((hi_s[col * (BKC / 4) + (sc_chunk >> 2)] >> ((sc_chunk & 3) * 2)) & 3) << 8);
-        float sc = __half2float(sc_s[col * (BKC / SPG) + sc_chunk / SPG]);
+#endif
         const __half2* cv = (const __half2*)(cb + id * 4);
         float2 a = __half22float2(cv[0]), b = __half22float2(cv[1]);
-        __half2* dst = (__half2*)(Bs + col * MT + cq * 4);
         dst[0] = __floats2half2_rn(a.x * sc, a.y * sc);
         dst[1] = __floats2half2_rn(b.x * sc, b.y * sc);
+#endif
       }
       __syncthreads();
       wmma::fragment<wmma::matrix_a, MT, MT, MT, __half, wmma::row_major> af[BM / MT];
@@ -315,7 +341,9 @@ __global__ void __launch_bounds__(NW * 32, 2) gemm_down_wmma(
         wmma::fragment<wmma::matrix_b, MT, MT, MT, __half, wmma::col_major> bf;
         wmma::load_matrix_sync(bf, Bs + (warp * NN + j) * MT * MT, MT);
 #pragma unroll
+#if VQ2_DIAG != 4
         for (int m = 0; m < BM / MT; m++) wmma::mma_sync(acc[m][j], af[m], bf, acc[m][j]);
+#endif
       }
       __syncthreads();
     }
@@ -346,6 +374,210 @@ __global__ void scatter_down(const float* __restrict__ outf, const int* __restri
   if (idx >= (long)Pmax * H) return;
   int p = idx / H, i = idx % H; int tok = sorted_tok[p];
   if (tok >= 0) atomicAdd(&out[(long)tok * H + i], outf[idx] * w_sorted[p]);
+}
+
+// ---- fp8 gateup: native fp8 mma.sync.m16n8k32.e4m3 (2x tensor cores; As/Bs stay fp8) ----
+// Same [BM,NR] output + same smem bytes as gemm_gateup_wmma (fp8 32-K tile == half 16-K tile in bytes),
+// but K=32/mma (half the mma steps) and the activation is consumed fp8 (no fp8->half up-convert) and
+// the weight tile is reconstructed to fp8. Verified mma register layout: see fp8_mma_test.cu.
+template <int BM, int NW, int NN, int BKC>
+__global__ void __launch_bounds__(NW * 32, 2) gemm_gateup_wmma_fp8(
+    const __nv_fp8_e4m3* __restrict__ xh, const int* __restrict__ sorted_tok, const int* __restrict__ be,
+    const __half* __restrict__ Cgu, const uint8_t* __restrict__ lo, const uint8_t* __restrict__ hi,
+    const __half* __restrict__ sgu, float* __restrict__ interf, int TwoI, int nsg, int SPG, int H) {
+  const int NR = NW * NN * MT;           // output rows per CTA N-tile
+  const int NN8 = NN * MT / 8;           // fp8 n8-tiles per warp (= NN*2)
+  int pid_b = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int g = lane >> 2, t = lane & 3;
+  int e = be[pid_b]; int rowbase = blockIdx.y * NR;
+  extern __shared__ __half smem[];
+  __half* cb = smem;                                 // [1024*4] half (centroids kept half)
+  uint8_t* lo_s = (uint8_t*)(cb + 1024 * 4);         // [NR][BKC]
+  uint8_t* hi_s = lo_s + NR * BKC;                   // [NR][BKC/4]
+  __half*  sc_s = (__half*)(hi_s + NR * (BKC / 4));  // [NR][BKC/SPG]
+  __nv_fp8_e4m3* As = (__nv_fp8_e4m3*)(sc_s + NR * (BKC / SPG));  // [BM][32] fp8
+  __nv_fp8_e4m3* Bs = As + BM * 32;                              // [NR][32] fp8
+  for (int u = threadIdx.x; u < 1024 * 4; u += blockDim.x) cb[u] = Cgu[u];
+  __shared__ int toks[BM];
+  for (int u = threadIdx.x; u < BM; u += blockDim.x) toks[u] = sorted_tok[pid_b * BM + u];
+  float acc[BM / 16][NN8][4];
+#pragma unroll
+  for (int m = 0; m < BM / 16; m++)
+#pragma unroll
+    for (int j = 0; j < NN8; j++) { acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.f; }
+  __syncthreads();
+  if (e < 0) return;
+  for (int ko = 0; ko < nsg; ko += BKC) {
+    __syncthreads();
+    for (int u = threadIdx.x; u < NR * (BKC / 4); u += blockDim.x) {
+      int col = u / (BKC / 4), uc = u % (BKC / 4);
+      ((uint*)(lo_s + col * BKC))[uc] = ((const uint*)(lo + ((long)e * TwoI + rowbase + col) * nsg + ko))[uc];
+    }
+    for (int u = threadIdx.x; u < NR * (BKC / 16); u += blockDim.x) {
+      int col = u / (BKC / 16), uc = u % (BKC / 16);
+      ((uint*)(hi_s + col * (BKC / 4)))[uc] = ((const uint*)(hi + ((long)e * TwoI + rowbase + col) * (nsg / 4) + ko / 4))[uc];
+    }
+    for (int s = threadIdx.x; s < NR * (BKC / SPG); s += blockDim.x) {
+      int col = s / (BKC / SPG), sc = s % (BKC / SPG);
+      sc_s[col * (BKC / SPG) + sc] = sgu[((long)e * TwoI + rowbase + col) * (nsg / SPG) + ko / SPG + sc];
+    }
+    __syncthreads();
+    for (int ki = 0; ki < BKC / 8; ki++) {           // 8 sub-groups (32 K cols) per fp8 step
+      int sg0 = ki * 8, gc0_sg = ko + sg0;
+      // As: vectorized uint copy (4 fp8 K-cols/thread) -- xh is already fp8, 4 contiguous = one uint
+      for (int idx = threadIdx.x; idx < BM * 8; idx += blockDim.x) {
+        int m = idx >> 3, kq = idx & 7; int tk = toks[m];
+        unsigned v = (tk >= 0) ? *(const unsigned*)(xh + (long)tk * H + gc0_sg * 4 + kq * 4) : 0u;
+        *(unsigned*)(As + m * 32 + kq * 4) = v;
+      }
+      // Bs: decode code -> 4 centroid halfs -> *sc -> 4 fp8 packed into one uint write (vectorized)
+      for (int idx = threadIdx.x; idx < NR * 8; idx += blockDim.x) {
+        int col = idx >> 3, sg = idx & 7, sc_chunk = sg0 + sg;
+        float sc = __half2float(sc_s[col * (BKC / SPG) + sc_chunk / SPG]);
+        int id = lo_s[col * BKC + sc_chunk] |
+                 (((hi_s[col * (BKC / 4) + (sc_chunk >> 2)] >> ((sc_chunk & 3) * 2)) & 3) << 8);
+        const __half2* cv = (const __half2*)(cb + id * 4);
+        float2 a = __half22float2(cv[0]), b = __half22float2(cv[1]);
+        // saturate to the e4m3 range (+/-448): the conversion NaN-encodes out-of-range, not inf
+        __nv_fp8x2_e4m3 p0(make_float2(fminf(fmaxf(a.x * sc, -448.f), 448.f), fminf(fmaxf(a.y * sc, -448.f), 448.f)));
+        __nv_fp8x2_e4m3 p1(make_float2(fminf(fmaxf(b.x * sc, -448.f), 448.f), fminf(fmaxf(b.y * sc, -448.f), 448.f)));
+        unsigned packed = (unsigned)(*(unsigned short*)&p0) | ((unsigned)(*(unsigned short*)&p1) << 16);
+        *(unsigned*)(Bs + col * 32 + sg * 4) = packed;
+      }
+      __syncthreads();
+#pragma unroll
+      for (int m4 = 0; m4 < BM / 16; m4++) {
+        unsigned a0 = *(const unsigned*)(As + (m4 * 16 + g)     * 32 + t * 4);
+        unsigned a1 = *(const unsigned*)(As + (m4 * 16 + g + 8) * 32 + t * 4);
+        unsigned a2 = *(const unsigned*)(As + (m4 * 16 + g)     * 32 + 16 + t * 4);
+        unsigned a3 = *(const unsigned*)(As + (m4 * 16 + g + 8) * 32 + 16 + t * 4);
+#pragma unroll
+        for (int n4 = 0; n4 < NN8; n4++) {
+          int nbase = (warp * NN8 + n4) * 8;
+          unsigned b0 = *(const unsigned*)(Bs + (nbase + g) * 32 + t * 4);
+          unsigned b1 = *(const unsigned*)(Bs + (nbase + g) * 32 + 16 + t * 4);
+          float* d = acc[m4][n4];
+          asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+      }
+      __syncthreads();
+    }
+  }
+#pragma unroll
+  for (int m4 = 0; m4 < BM / 16; m4++)
+#pragma unroll
+    for (int n4 = 0; n4 < NN8; n4++) {
+      int nbase = (warp * NN8 + n4) * 8; float* d = acc[m4][n4];
+      long r0 = (long)(pid_b * BM + m4 * 16 + g)     * TwoI + rowbase + nbase;
+      long r8 = (long)(pid_b * BM + m4 * 16 + g + 8) * TwoI + rowbase + nbase;
+      interf[r0 + 2 * t + 0] = d[0]; interf[r0 + 2 * t + 1] = d[1];
+      interf[r8 + 2 * t + 0] = d[2]; interf[r8 + 2 * t + 1] = d[3];
+    }
+}
+
+// ---- fp8 down: native fp8 mma + FUSED scatter (atomicAdd from registers, no scratch) ----
+template <int BM, int NW, int NN, int BKC>
+__global__ void __launch_bounds__(NW * 32, 2) gemm_down_wmma_fp8(
+    const __nv_fp8_e4m3* __restrict__ vb, const int* __restrict__ be,
+    const int* __restrict__ sorted_tok, const float* __restrict__ w_sorted,
+    const __half* __restrict__ Cd, const uint8_t* __restrict__ lo, const uint8_t* __restrict__ hi,
+    const __half* __restrict__ sdn, float* __restrict__ out, int H, int nsd, int SPG, int Ip) {
+  const int NR = NW * NN * MT;
+  const int NN8 = NN * MT / 8;
+  int pid_b = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int g = lane >> 2, t = lane & 3;
+  int e = be[pid_b]; int rowbase = blockIdx.y * NR;
+  extern __shared__ __half smem[];
+  __half* cb = smem;
+  uint8_t* lo_s = (uint8_t*)(cb + 1024 * 4);
+  uint8_t* hi_s = lo_s + NR * BKC;
+  __half*  sc_s = (__half*)(hi_s + NR * (BKC / 4));
+  __nv_fp8_e4m3* As = (__nv_fp8_e4m3*)(sc_s + NR * (BKC / SPG));
+  __nv_fp8_e4m3* Bs = As + BM * 32;
+  for (int u = threadIdx.x; u < 1024 * 4; u += blockDim.x) cb[u] = Cd[u];
+  float acc[BM / 16][NN8][4];
+#pragma unroll
+  for (int m = 0; m < BM / 16; m++)
+#pragma unroll
+    for (int j = 0; j < NN8; j++) { acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.f; }
+  __syncthreads();
+  if (e < 0) return;
+  for (int ko = 0; ko < nsd; ko += BKC) {
+    __syncthreads();
+    for (int u = threadIdx.x; u < NR * (BKC / 4); u += blockDim.x) {
+      int col = u / (BKC / 4), uc = u % (BKC / 4);
+      ((uint*)(lo_s + col * BKC))[uc] = ((const uint*)(lo + ((long)e * H + rowbase + col) * nsd + ko))[uc];
+    }
+    for (int u = threadIdx.x; u < NR * (BKC / 16); u += blockDim.x) {
+      int col = u / (BKC / 16), uc = u % (BKC / 16);
+      ((uint*)(hi_s + col * (BKC / 4)))[uc] = ((const uint*)(hi + ((long)e * H + rowbase + col) * (nsd / 4) + ko / 4))[uc];
+    }
+    for (int s = threadIdx.x; s < NR * (BKC / SPG); s += blockDim.x) {
+      int col = s / (BKC / SPG), sc = s % (BKC / SPG);
+      sc_s[col * (BKC / SPG) + sc] = sdn[((long)e * H + rowbase + col) * (nsd / SPG) + ko / SPG + sc];
+    }
+    __syncthreads();
+    for (int ki = 0; ki < BKC / 8; ki++) {
+      int sg0 = ki * 8, gc0_sg = ko + sg0;
+      for (int idx = threadIdx.x; idx < BM * 8; idx += blockDim.x) {
+        int m = idx >> 3, kq = idx & 7;
+        *(unsigned*)(As + m * 32 + kq * 4) =
+            *(const unsigned*)(vb + (long)(pid_b * BM + m) * Ip + gc0_sg * 4 + kq * 4);
+      }
+      for (int idx = threadIdx.x; idx < NR * 8; idx += blockDim.x) {
+        int col = idx >> 3, sg = idx & 7, sc_chunk = sg0 + sg;
+        float sc = __half2float(sc_s[col * (BKC / SPG) + sc_chunk / SPG]);
+        int id = lo_s[col * BKC + sc_chunk] |
+                 (((hi_s[col * (BKC / 4) + (sc_chunk >> 2)] >> ((sc_chunk & 3) * 2)) & 3) << 8);
+        const __half2* cv = (const __half2*)(cb + id * 4);
+        float2 a = __half22float2(cv[0]), b = __half22float2(cv[1]);
+        // saturate to the e4m3 range (+/-448): the conversion NaN-encodes out-of-range, not inf
+        __nv_fp8x2_e4m3 p0(make_float2(fminf(fmaxf(a.x * sc, -448.f), 448.f), fminf(fmaxf(a.y * sc, -448.f), 448.f)));
+        __nv_fp8x2_e4m3 p1(make_float2(fminf(fmaxf(b.x * sc, -448.f), 448.f), fminf(fmaxf(b.y * sc, -448.f), 448.f)));
+        unsigned packed = (unsigned)(*(unsigned short*)&p0) | ((unsigned)(*(unsigned short*)&p1) << 16);
+        *(unsigned*)(Bs + col * 32 + sg * 4) = packed;
+      }
+      __syncthreads();
+#pragma unroll
+      for (int m4 = 0; m4 < BM / 16; m4++) {
+        unsigned a0 = *(const unsigned*)(As + (m4 * 16 + g)     * 32 + t * 4);
+        unsigned a1 = *(const unsigned*)(As + (m4 * 16 + g + 8) * 32 + t * 4);
+        unsigned a2 = *(const unsigned*)(As + (m4 * 16 + g)     * 32 + 16 + t * 4);
+        unsigned a3 = *(const unsigned*)(As + (m4 * 16 + g + 8) * 32 + 16 + t * 4);
+#pragma unroll
+        for (int n4 = 0; n4 < NN8; n4++) {
+          int nbase = (warp * NN8 + n4) * 8;
+          unsigned b0 = *(const unsigned*)(Bs + (nbase + g) * 32 + t * 4);
+          unsigned b1 = *(const unsigned*)(Bs + (nbase + g) * 32 + 16 + t * 4);
+          float* d = acc[m4][n4];
+          asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+      }
+      __syncthreads();
+    }
+  }
+  // fused scatter: atomicAdd the 4 acc values straight from registers (token-row x H-col)
+#pragma unroll
+  for (int m4 = 0; m4 < BM / 16; m4++)
+#pragma unroll
+    for (int n4 = 0; n4 < NN8; n4++) {
+      int nbase = (warp * NN8 + n4) * 8; float* d = acc[m4][n4];
+      int p0 = pid_b * BM + m4 * 16 + g, p8 = pid_b * BM + m4 * 16 + g + 8;
+      int tok0 = sorted_tok[p0], tok8 = sorted_tok[p8];
+      int c0 = rowbase + nbase + 2 * t, c1 = c0 + 1;
+      if (tok0 >= 0) { atomicAdd(&out[(long)tok0 * H + c0], d[0] * w_sorted[p0]);
+                       atomicAdd(&out[(long)tok0 * H + c1], d[1] * w_sorted[p0]); }
+      if (tok8 >= 0) { atomicAdd(&out[(long)tok8 * H + c0], d[2] * w_sorted[p8]);
+                       atomicAdd(&out[(long)tok8 * H + c1], d[3] * w_sorted[p8]); }
+    }
 }
 
 static int g_shm(int VD, int BM) { return 1024 * VD * (int)sizeof(__half) + BM * CT * VD * (int)sizeof(float); }
@@ -405,6 +637,22 @@ void gateup_wmma(torch::Tensor xh, torch::Tensor sorted_tok, torch::Tensor be, t
   TORCH_CHECK(false, "bad NW/NN/BKC");
 }
 
+#define GUWF_CASE(NWV, NNV, BKCV) if (NW == NWV && NN == NNV && BKC == BKCV) { \
+    cudaFuncSetAttribute(gemm_gateup_wmma_fp8<64, NWV, NNV, BKCV>, cudaFuncAttributeMaxDynamicSharedMemorySize, wmma_shm(NWV, NNV, BKCV)); \
+    dim3 grid(nblk, TwoI / (NWV * NNV * MT)); \
+    gemm_gateup_wmma_fp8<64, NWV, NNV, BKCV><<<grid, NWV * 32, wmma_shm(NWV, NNV, BKCV)>>>( \
+        (const __nv_fp8_e4m3*)xh.data_ptr(), sorted_tok.data_ptr<int>(), be.data_ptr<int>(), \
+        (const __half*)Cgu.data_ptr(), lo.data_ptr<uint8_t>(), hi.data_ptr<uint8_t>(), \
+        (const __half*)sgu.data_ptr(), interf.data_ptr<float>(), TwoI, nsg, SPG, H); return; }
+
+void gateup_wmma_fp8(torch::Tensor xh, torch::Tensor sorted_tok, torch::Tensor be, torch::Tensor Cgu,
+                     torch::Tensor lo, torch::Tensor hi, torch::Tensor sgu, torch::Tensor interf,
+                     int nblk, int TwoI, int nsg, int SPG, int NN, int BKC, int NW) {
+  int H = xh.size(1);
+  GUWF_CASE(8, 2, 64) GUWF_CASE(8, 4, 64) GUWF_CASE(8, 2, 128) GUWF_CASE(8, 1, 128) GUWF_CASE(8, 2, 32) GUWF_CASE(8, 4, 32)
+  TORCH_CHECK(false, "bad NW/NN/BKC for fp8 gateup");
+}
+
 void silu_comb(torch::Tensor interf, torch::Tensor inter, torch::Tensor sorted_tok,
                torch::Tensor inv_xh, int Pmax, int I) {
   long n = (long)Pmax * I; int thr = 256;
@@ -429,6 +677,22 @@ void down_wmma(torch::Tensor vb, torch::Tensor be, torch::Tensor sorted_tok, tor
   TORCH_CHECK(false, "bad NW/NN/BKC");
 }
 
+#define DNWF_CASE(NWV, NNV, BKCV) if (NW == NWV && NN == NNV && BKC == BKCV) { \
+    cudaFuncSetAttribute(gemm_down_wmma_fp8<64, NWV, NNV, BKCV>, cudaFuncAttributeMaxDynamicSharedMemorySize, wmma_shm(NWV, NNV, BKCV)); \
+    dim3 grid(nblk, H / (NWV * NNV * MT)); \
+    gemm_down_wmma_fp8<64, NWV, NNV, BKCV><<<grid, NWV * 32, wmma_shm(NWV, NNV, BKCV)>>>( \
+        (const __nv_fp8_e4m3*)vb.data_ptr(), be.data_ptr<int>(), sorted_tok.data_ptr<int>(), w_sorted.data_ptr<float>(), \
+        (const __half*)Cd.data_ptr(), lo.data_ptr<uint8_t>(), hi.data_ptr<uint8_t>(), (const __half*)sdn.data_ptr(), \
+        out.data_ptr<float>(), H, nsd, SPG, Ip); return; }
+
+void down_wmma_fp8(torch::Tensor vb, torch::Tensor be, torch::Tensor sorted_tok, torch::Tensor w_sorted,
+                   torch::Tensor Cd, torch::Tensor lo, torch::Tensor hi,
+                   torch::Tensor sdn, torch::Tensor out, int nblk, int H, int nsd, int SPG, int NN, int BKC, int NW) {
+  int Ip = vb.size(1);
+  DNWF_CASE(8, 2, 64) DNWF_CASE(8, 4, 64) DNWF_CASE(8, 2, 128) DNWF_CASE(8, 1, 128) DNWF_CASE(8, 2, 32) DNWF_CASE(8, 4, 32)
+  TORCH_CHECK(false, "bad NW/NN/BKC for fp8 down");
+}
+
 void scatter(torch::Tensor outf, torch::Tensor sorted_tok, torch::Tensor w_sorted, torch::Tensor out,
              int Pmax, int H) {
   long n = (long)Pmax * H; int thr = 256;
@@ -440,7 +704,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gateup", &gateup_launch, "vq2 grouped gate_up+silu");
   m.def("down", &down_launch, "vq2 grouped down+scatter");
   m.def("gateup_wmma", &gateup_wmma, "vq2 wmma gate_up GEMM -> 2I temp");
+  m.def("gateup_wmma_fp8", &gateup_wmma_fp8, "vq2 fp8-mma gate_up GEMM -> 2I temp");
   m.def("silu_comb", &silu_comb, "silu(gate)*up");
   m.def("down_wmma", &down_wmma, "vq2 wmma down GEMM -> Pmax,H temp");
+  m.def("down_wmma_fp8", &down_wmma_fp8, "vq2 fp8-mma down GEMM + fused scatter");
   m.def("scatter", &scatter, "scatter outf -> out with routing weight");
 }
