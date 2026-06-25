@@ -606,7 +606,20 @@ def _patch_frspec():
         dev = head.weight.device
         N, packed = d["weight"].shape
         hid = packed * 2
-        qm = head.quant_method                                   # ModelOptNvFp4W4A16LinearMethod
+        # shared_head.head.quant_method is UnquantizedEmbeddingMethod: its prefix
+        # "...shared_head.head" lacks "lm_head", so vq2's get_quant_method returns None
+        # for it (hence "'UnquantizedEmbeddingMethod' has no attribute quant_config" at
+        # load). Clone the SAME NVFP4 W4A16 method the recipe gives lm_head from any
+        # NVFP4 linear already built in this MTP model (its attn projections qualify).
+        qm = None
+        for _m in self.model.modules():
+            _q = getattr(_m, "quant_method", None)
+            if type(_q).__name__ == "ModelOptNvFp4W4A16LinearMethod" \
+                    and getattr(_q, "quant_config", None) is not None:
+                qm = _q
+                break
+        if qm is None:
+            raise RuntimeError("FR-Spec: no ModelOptNvFp4W4A16LinearMethod to clone for draft head")
         method = type(qm)(qm.quant_config)
         layer = torch.nn.Module()
         layer.params_dtype = torch.bfloat16                      # read by prepare_fp4_layer_for_marlin
