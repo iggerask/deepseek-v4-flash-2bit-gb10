@@ -432,6 +432,23 @@ except Exception:
     pass
 
 
+def _patch_mhc_torch():
+    """Route the MTP drafter's mhc_post through the torch reference instead of TileLang.
+    The plugin already swaps sparse-MLA + indexer to torch sm_121 references (above), but
+    mhc_post was missed: its TileLang kernel hits an illegal memory access during the
+    drafter's cudagraph capture on sm_121, crashing spec decode. mhc_post_torch has an
+    identical signature (pure einsum+mul+add => capture-safe). VQ2_MHC_TORCH=0 opts out."""
+    if os.environ.get("VQ2_MHC_TORCH", "1") != "1":
+        return
+    try:
+        import vllm.models.deepseek_v4.nvidia.mtp as mtp
+        from vllm.model_executor.kernels.mhc.torch import mhc_post_torch
+        mtp.mhc_post_tilelang = mhc_post_torch
+        print("[vq2] mhc_post patched (torch sm_121 reference)", flush=True)
+    except Exception as e:  # pragma: no cover
+        print(f"[vq2] WARN: could not patch mhc_post: {e}", flush=True)
+
+
 def _patch_drafter_full_cudagraph():
     """Let the spec-decode DRAFTER use FULL cudagraph (vLLM hard-forces it PIECEWISE-only in
     SpecDecodeBaseProposer.initialize_cudagraph_keys). On sm_121 the DS4 attention runs via graph-safe
@@ -655,6 +672,7 @@ def register():
     _patch_o_proj()
     _patch_lm_head()
     _patch_sparse_attn()
+    _patch_mhc_torch()             # sm_121: mhc_post TileLang illegal-access under cudagraph -> torch ref (VQ2_MHC_TORCH)
     _patch_workspace_overalloc()   # long-ctx: shrink max_model_len-sized prefill workspaces (VQ2_WORKSPACE_DIV)
     _patch_adaptive_prefill()      # long-ctx: adaptive prefill chunk sizing (VQ2_ADAPTIVE_PREFILL)
     _patch_drafter_full_cudagraph()
