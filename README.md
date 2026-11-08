@@ -131,3 +131,6 @@ vllm serve models/DeepSeek-V4-Flash-2bit \
 - The first prefill JIT-compiles `vq2_grouped.cu` (needs `nvcc` on PATH); subsequent runs are cached.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the 2-bit stack works and the quality/speed methodology.
+
+**Related:** [ports/siege-ladder-spark](ports/siege-ladder-spark/) — a port plan, Linux patch and performance estimate for running
+Siege-Ladder (DeepSeek-V4.1-Flash-1017, 373 GB, experts streamed from NVMe) on one Spark.

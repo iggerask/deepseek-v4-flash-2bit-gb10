@@ -1,0 +1,203 @@
+From 54c9d5907f489d9c70aeefe5806dfe551cda0c74 Mon Sep 17 00:00:00 2001
+From: Siege-Ladder Spark port <noreply@example.com>
+Date: Sun, 8 Nov 2026 17:05:34 +0000
+Subject: [PATCH] mmap : llama_read_scattered on Linux - O_DIRECT + kernel AIO
+ (Spark port)
+
+The Engram tables are unmapped by default since P8d (LLAMA_ENGRAM_UNMAPPED=1) and
+their rows read through llama_read_scattered, which had a Windows body only and
+returned false elsewhere - on Linux fill_layer then stops the process. This adds
+the Linux body with the same contract: pieces sorted, each 4 KiB sector read once
+with O_DIRECT (page cache bypassed - on a unified-memory DGX Spark the page cache
+would compete with the expert cache), n_thr threads with qd reads in flight each
+through io_submit/io_getevents (no liburing), fds opened once per file for the
+process, buffered pread fallback for a file that refuses O_DIRECT or when no AIO
+context can be created. Checked against plain reads on random scattered pieces
+(40 trials, 1-8 threads, qd 1-64, shared sectors, two files): byte-identical.
+---
+ src/llama-mmap.cpp | 162 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 162 insertions(+)
+
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 31ded98de..019018333 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -13,6 +13,11 @@
+ #include <mutex>
+ #include <thread>
+ #include <unordered_map>
++#if defined(__linux__)
++#include <linux/aio_abi.h>
++#include <sys/syscall.h>
++#include <cstdlib>
++#endif
+ 
+ #ifdef __has_include
+     #if __has_include(<unistd.h>)
+@@ -1452,6 +1457,163 @@ bool llama_read_scattered(const std::string (&paths)[2], std::vector<llama_scatt
+         }
+     }
+     return ok;
++#elif defined(__linux__)
++    // Siege-Ladder on Linux (DGX Spark port): the same contract as the Windows path - every 4 KiB sector read once with
++    // O_DIRECT (page cache bypassed: on a unified-memory box the page cache would eat the expert cache's memory), n_thr
++    // threads with qd reads in flight each through kernel AIO (io_submit / io_getevents; no liburing needed). The fds are
++    // opened once per file for the process. Falls back to buffered pread for a file that refuses O_DIRECT.
++    constexpr uint64_t SEC = 4096;
++    if (pieces.empty()) {
++        return true;
++    }
++    n_thr = std::max(1, n_thr);
++    qd    = std::min(std::max(1, qd), 256);
++
++    std::sort(pieces.begin(), pieces.end(), [](const llama_scatter_piece & a, const llama_scatter_piece & b) {
++        return a.file != b.file ? a.file < b.file : a.off < b.off;
++    });
++    std::vector<size_t> sec0;
++    for (size_t i = 0; i < pieces.size(); ++i) {
++        const uint64_t s = pieces[i].off & ~(SEC - 1);
++        GGML_ASSERT(pieces[i].file < 2 && (pieces[i].off - s) + pieces[i].len <= SEC);
++        if (i == 0 || pieces[i].file != pieces[i - 1].file || s != (pieces[i - 1].off & ~(SEC - 1))) {
++            sec0.push_back(i);
++        }
++    }
++    sec0.push_back(pieces.size());
++    const size_t n_sec = sec0.size() - 1;
++
++    struct sl_fd { int fd; bool direct; };
++    static std::mutex mtx;
++    static std::unordered_map<std::string, sl_fd> fds;
++    sl_fd fs[2] = { { -1, false }, { -1, false } };
++    {
++        std::lock_guard<std::mutex> lk(mtx);
++        for (int f = 0; f < 2; ++f) {
++            if (paths[f].empty()) {
++                continue;
++            }
++            auto it = fds.find(paths[f]);
++            if (it == fds.end()) {
++                sl_fd x = { open(paths[f].c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC), true };
++                if (x.fd < 0) {
++                    x = { open(paths[f].c_str(), O_RDONLY | O_CLOEXEC), false };
++                }
++                LLAMA_LOG_INFO("%s: Siege-Ladder (linux): %s - %s\n", __func__, paths[f].c_str(),
++                        x.fd < 0 ? "open failed" : (x.direct ? "O_DIRECT + AIO" : "buffered pread"));
++                it = fds.emplace(paths[f], x).first;
++            }
++            fs[f] = it->second;
++        }
++    }
++    qd = (int) std::min<size_t>((size_t) qd, (n_sec + (size_t) n_thr - 1)/(size_t) n_thr);
++    qd = std::max(1, qd);
++
++    std::atomic<bool> ok { true };
++    auto copy_out = [&](size_t j, const uint8_t * sec, ssize_t got) {
++        const uint64_t base = pieces[sec0[j]].off & ~(SEC - 1);
++        for (size_t k = sec0[j]; k < sec0[j + 1]; ++k) {
++            const uint64_t in = pieces[k].off - base;
++            if (got >= 0 && in + pieces[k].len <= (uint64_t) got) {
++                std::memcpy(pieces[k].dst, sec + in, pieces[k].len);
++            } else {
++                ok = false;
++            }
++        }
++    };
++    auto worker = [&](int t) {
++        uint8_t * buf = nullptr;
++        if (posix_memalign((void **) &buf, SEC, (size_t) SEC*qd) != 0) {
++            ok = false;
++            return;
++        }
++        aio_context_t ctx = 0;
++        const bool use_aio = syscall(SYS_io_setup, qd, &ctx) == 0;
++        size_t next = (size_t) t;
++        if (!use_aio) {
++            // no AIO context (e.g. fs.aio-max-nr exhausted): synchronous reads on this thread
++            for (; ok && next < n_sec; next += (size_t) n_thr) {
++                const llama_scatter_piece & p = pieces[sec0[next]];
++                const int fd = fs[p.file].fd;
++                if (fd < 0) { ok = false; break; }
++                copy_out(next, buf, pread(fd, buf, SEC, (off_t) (p.off & ~(SEC - 1))));
++            }
++            free(buf);
++            return;
++        }
++        std::vector<struct iocb> cb(qd);
++        std::vector<size_t>      sec_of(qd, 0);
++        int in_flight = 0;
++        auto issue = [&](int q) -> bool {
++            while (ok && next < n_sec) {
++                const size_t j = next;
++                next += (size_t) n_thr;
++                const llama_scatter_piece & p = pieces[sec0[j]];
++                const sl_fd & f = fs[p.file];
++                if (f.fd < 0) { ok = false; return false; }
++                const uint64_t off = p.off & ~(SEC - 1);
++                if (!f.direct) { // buffered file: read it synchronously, then take the next sector
++                    copy_out(j, buf + (size_t) q*SEC, pread(f.fd, buf + (size_t) q*SEC, SEC, (off_t) off));
++                    continue;
++                }
++                std::memset(&cb[q], 0, sizeof(struct iocb));
++                cb[q].aio_fildes     = (uint32_t) f.fd;
++                cb[q].aio_lio_opcode = IOCB_CMD_PREAD;
++                cb[q].aio_buf        = (uint64_t) (uintptr_t) (buf + (size_t) q*SEC);
++                cb[q].aio_nbytes     = SEC;
++                cb[q].aio_offset     = (int64_t) off;
++                cb[q].aio_data       = (uint64_t) q;
++                sec_of[q] = j;
++                struct iocb * pcb = &cb[q];
++                if (syscall(SYS_io_submit, ctx, 1, &pcb) != 1) {
++                    copy_out(j, buf + (size_t) q*SEC, pread(f.fd, buf + (size_t) q*SEC, SEC, (off_t) off));
++                    continue;
++                }
++                return true;
++            }
++            return false;
++        };
++        for (int q = 0; q < qd; ++q) {
++            if (!issue(q)) {
++                break;
++            }
++            in_flight++;
++        }
++        std::vector<struct io_event> evs(qd);
++        while (in_flight > 0) {
++            const long n = syscall(SYS_io_getevents, ctx, 1, (long) in_flight, evs.data(), nullptr);
++            if (n < 0) {
++                if (errno == EINTR) {
++                    continue;
++                }
++                ok = false;
++                break; // io_destroy below waits for what is still in flight
++            }
++            for (long i = 0; i < n; ++i) {
++                const int q = (int) evs[i].data;
++                copy_out(sec_of[q], buf + (size_t) q*SEC, (ssize_t) evs[i].res);
++                in_flight--;
++                if (issue(q)) {
++                    in_flight++;
++                }
++            }
++        }
++        syscall(SYS_io_destroy, ctx);
++        free(buf);
++    };
++    if (n_thr == 1) {
++        worker(0);
++    } else {
++        std::vector<std::thread> ths;
++        ths.reserve(n_thr);
++        for (int t = 0; t < n_thr; ++t) {
++            ths.emplace_back(worker, t);
++        }
++        for (auto & th : ths) {
++            th.join();
++        }
++    }
++    return ok;
+ #else
+     GGML_UNUSED(paths); GGML_UNUSED(pieces); GGML_UNUSED(n_thr); GGML_UNUSED(qd);
+     return false;
+-- 
+2.43.0
+
