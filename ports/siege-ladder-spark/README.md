@@ -137,11 +137,50 @@ Other workloads, extrapolated more loosely. Read these as ±30%.
    there are more misses per step and the gain would be smaller. Siege-Ladder has no MTP path yet.
 3. **A faster drive or a mirror.** On a Spark this matters less than on the PC, because ~3 waited misses per token is
    ~4–10 ms. A USB4 NVMe as `LLAMA_MOE_STREAM_MIRROR` helps prefill more than decode.
-4. **Two Sparks over ConnectX-7** (256 GB) would hold every expert, but a layer split runs the halves one after the
-   other, so decode stays at ~20 tok/s. It would also need the streaming code to coexist with ggml-rpc, which nobody
-   has tried.
+4. **Two Sparks** (§5): a layer split with llama.cpp barely helps decode (~18 tok/s); tensor parallelism could reach
+   ~28 tok/s, or ~34–37 with MTP, but needs a vLLM-style stack.
 
-## 5. Open uncertainties
+## 5. Two Sparks
+
+Two Sparks over their ConnectX-7 link (200 GbE RoCE) give ~215 GiB to work with. Every expert plus the dense part is
+158 GiB, so **the whole model except Engram fits**, with ~57 GiB left for KV. The drive drops out of decode, and you no
+longer need Siege-Ladder's streaming. That is the point: its ladder exists only because the model doesn't fit. The
+Engram tables (203 GB) stay on NVMe as row lookups, and they live on node A, because Engram layers 1 and 14 are both
+in the first half.
+
+How much faster it gets depends almost entirely on **how the model is split** (`estimate.py --sparks 2`):
+
+| split | how | decode, central (range) | software that does it |
+|---|---|---|---|
+| pipeline (layers 0–19 / 20–39) | nodes run one after the other, so a token still reads all 8 GB at one node's bandwidth | **~18 tok/s** (15–21) | llama.cpp `ggml-rpc`, available today |
+| expert-parallel (192 experts/layer each) | dense replicated, so each node still reads all 5.5 GB of it | ~20 (17–23) | vLLM/SGLang EP |
+| **tensor-parallel (TP=2)** | every matrix halved, so each node reads ~4 GB in parallel; 80 small all-reduces per token | **~28 tok/s** (22–35) | vLLM + NCCL over RoCE |
+| TP=2 + MTP K=2 | +20–29%, as measured on this repo's stack | **~34–37** (27–45) | the same, plus MTP |
+| *one Spark, Siege-Ladder (§4)* | | *~17* | |
+
+- **The easy path buys almost nothing.** Pipeline over `ggml-rpc` is the only multi-node mode llama.cpp has. It
+  removes the drive misses, but decode stays bandwidth-bound at one node's 273 GB/s: ~17 → ~18 tok/s. On top of
+  that, the fork's streaming code attaches to the local CUDA backend directly (mailbox, `cudaMemcpy` into slots), so
+  you would run the fork *without* `--moe-stream-*`, plus ~2 network hops per token.
+- **The real gain needs tensor parallelism**, and that means a vLLM-style stack, not llama.cpp. This repo's vq2
+  plugin is the natural base: it already runs DeepSeek-V4 on GB10, and vLLM supports TP across two Sparks. The work
+  would be:
+  1. V4.1-Flash-1017 support (Engram lookups) in the model code;
+  2. the 2-bit VQ experts sharded along the intermediate dimension;
+  3. NCCL over the ConnectX link.
+  None of this exists yet; it is a project, not a config change.
+- **Or spend the second Spark on quality instead of speed.** With ~57 GiB spare you can afford ~3-bit experts (~205
+  GB of experts) instead of ~2.4-bit. On Siege-Ladder's API sets, the step toward IQ3 recovered ~28% of the Q2→Q4
+  gap. For this repo's own V4-Flash, two Sparks hold the ≥4.25 bpw experts (~150 GB) that
+  [ARCHITECTURE.md](../../docs/ARCHITECTURE.md) says close the +27% PPL gap.
+- **Prefill gains the most.** With nothing streaming from the drive and TP doubling the compute, agent-turn reading
+  should roughly double over one Spark (~700–1000 tok/s, low confidence). Long documents get the same ~2× from
+  compute. 1M context fits without taking memory from the experts.
+- **Unmeasured:** NCCL small-message all-reduce latency over Spark-to-Spark RoCE, assumed 15–60 µs. At 80 per token,
+  it decides whether TP lands at 22 or 35 tok/s. Measure it with `nccl-tests all_reduce_perf -b 8K -e 64K` before
+  committing to the TP route.
+
+## 6. Open uncertainties
 
 - **Internal SSD bandwidth.** Public figures disagree, from 3.4 GB/s to 11+ GB/s, and from PCIe Gen4 to Gen5 x4.
   Measure it and pass the number to `estimate.py --ssd-gbs`:
